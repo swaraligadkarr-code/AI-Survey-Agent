@@ -1,8 +1,9 @@
-
 import os
 import re
 import json
 import time
+import io
+import csv
 from pathlib import Path
 from datetime import datetime
 
@@ -10,8 +11,16 @@ import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
 from google import genai
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import mm
 
-# ---------------- CONFIGURATION ----------------
+# ============================================================
+# SURVEY STUDIO AI — upgraded local version
+# Keeps the existing Gemini + Streamlit + JSON storage setup.
+# ============================================================
 
 load_dotenv()
 
@@ -19,34 +28,92 @@ st.set_page_config(
     page_title="Survey Studio AI",
     page_icon="📝",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+)
+
+
+# ---------------- MODERN DARK THEME ----------------
+st.markdown(
+    """
+    <style>
+    :root { color-scheme: dark; }
+    [data-testid="stAppViewContainer"] {
+        background: linear-gradient(135deg, #0b1020 0%, #111827 55%, #15112b 100%);
+        color: #f3f4f6;
+    }
+    [data-testid="stHeader"] { background: rgba(11, 16, 32, 0.82); }
+    [data-testid="stSidebar"] {
+        background: #0b1020;
+        border-right: 1px solid #273449;
+    }
+    [data-testid="stSidebar"] * { color: #e5e7eb; }
+    h1, h2, h3 { color: #f9fafb !important; letter-spacing: -0.02em; }
+    p, label, [data-testid="stMarkdownContainer"] { color: #d1d5db; }
+    [data-testid="stVerticalBlockBorderWrapper"],
+    [data-testid="stExpander"], [data-testid="stForm"] {
+        background: rgba(22, 31, 49, 0.78);
+        border: 1px solid #334155;
+        border-radius: 14px;
+    }
+    input, textarea, [data-baseweb="select"] > div {
+        background-color: #172033 !important;
+        color: #f9fafb !important;
+        border-color: #475569 !important;
+    }
+    [data-testid="stMetric"] {
+        background: #172033; border: 1px solid #334155;
+        padding: 14px; border-radius: 12px;
+    }
+    [data-testid="stMetricValue"] { color: #c4b5fd !important; }
+    .stButton > button, .stDownloadButton > button {
+        border-radius: 10px; border: 1px solid #6d5ce8;
+        background: linear-gradient(90deg, #6d28d9, #7c3aed);
+        color: white; font-weight: 600; min-height: 2.6rem;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        border-color: #a78bfa;
+        background: linear-gradient(90deg, #7c3aed, #8b5cf6);
+        color: white;
+    }
+    hr { border-color: #334155; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 DATA_DIR = Path("survey_data")
 DATA_DIR.mkdir(exist_ok=True)
-
 SURVEYS_FILE = DATA_DIR / "surveys.json"
 RESPONSES_FILE = DATA_DIR / "responses.json"
-
 api_key = os.getenv("GEMINI_API_KEY")
 
 
-# ---------------- LOCAL STORAGE ----------------
+# ---------------- LOCAL JSON STORAGE ----------------
 
 def load_json(path):
+    """Load a JSON list safely. Keep the existing local file format."""
     if not path.exists():
         return []
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
     except (json.JSONDecodeError, OSError):
+        st.error(f"Could not read {path}. Check that the file contains valid JSON.")
         return []
 
 
 def save_json(path, data):
-    path.write_text(
+    """Write safely using a temporary file, then replace the original."""
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(
         json.dumps(data, indent=2, ensure_ascii=False),
-        encoding="utf-8"
+        encoding="utf-8",
     )
+    temp_path.replace(path)
+
+
+def make_id():
+    return datetime.now().strftime("%Y%m%d%H%M%S%f")
 
 
 # ---------------- SESSION STATE ----------------
@@ -54,43 +121,106 @@ def save_json(path, data):
 if "current_survey" not in st.session_state:
     st.session_state.current_survey = None
 
-if "page" not in st.session_state:
-    st.session_state.page = "Create Survey"
 
-
-# ---------------- SIDEBAR ----------------
-
-with st.sidebar:
-    st.title("📝 Survey Studio AI")
-    st.caption("AI-powered survey workspace")
-    st.divider()
-
-    page = st.radio(
-        "Navigation",
-        [
-            "Create Survey",
-            "Edit Surveys",
-            "Collect Responses",
-            "Analytics",
-            "Survey History"
-        ],
-        key="navigation"
-    )
-
-    st.session_state.page = page
-
-    st.divider()
-    st.caption("Powered by Google Gemini")
-
-
-# ---------------- HELPER FUNCTIONS ----------------
+# ---------------- TEXT / QUESTION HELPERS ----------------
 
 def clean_text(text):
-    text = re.sub(r"(?m)^\s*#{1,6}\s*", "", text)
-    text = text.replace("**", "").replace("__", "")
-    text = text.replace("`", "")
+    text = re.sub(r"(?m)^\s*#{1,6}\s*", "", str(text or ""))
+    text = text.replace("**", "").replace("__", "").replace("`", "")
     text = re.sub(r"(?m)^\s*[-*_]{3,}\s*$", "", text)
     return text.strip()
+
+
+QUESTION_RE = re.compile(r"^\s*(\d+)[.)]\s+(.+?)\s*$")
+OPTION_RE = re.compile(r"^\s*(?:[-*]\s*)?(?:\(?([A-D])\)?[.)]|[-*])\s*(.+?)\s*$", re.I)
+
+
+def parse_survey(content):
+    """
+    Convert the generated numbered text into question records.
+    Supports the common numbered-question and A/B/C/D option formats
+    generated by the existing prompt. Any unrecognized text is retained
+    as introductory text rather than discarded.
+    """
+    lines = clean_text(content).splitlines()
+    questions = []
+    intro_lines = []
+    current = None
+
+    for line in lines:
+        match = QUESTION_RE.match(line)
+        if match:
+            if current:
+                questions.append(current)
+            raw = match.group(2).strip()
+            type_match = re.search(r"\((multiple choice|rating scale|yes/?no|binary|open[- ]ended)\)", raw, re.I)
+            qtype = type_match.group(1).lower() if type_match else ""
+            question_text = re.sub(
+                r"\s*\((?:multiple choice|rating scale|yes/?no|binary|open[- ]ended)\)\s*",
+                "",
+                raw,
+                flags=re.I,
+            ).strip()
+            current = {
+                "number": len(questions) + 1,
+                "text": question_text,
+                "type": infer_type(qtype, question_text),
+                "options": [],
+            }
+            continue
+
+        if current:
+            opt = OPTION_RE.match(line)
+            if opt:
+                value = opt.group(2).strip()
+                if value:
+                    current["options"].append(value)
+            elif line.strip() and not line.strip().lower().startswith(("introduction:", "survey title:")):
+                # Keep wrapped question lines together until the next numbered item.
+                if not current["options"]:
+                    current["text"] += " " + line.strip()
+        elif line.strip():
+            intro_lines.append(line.strip())
+
+    if current:
+        questions.append(current)
+
+    for index, question in enumerate(questions, start=1):
+        question["number"] = index
+        if question["type"] == "Multiple choice" and not question["options"]:
+            question["options"] = ["Option 1", "Option 2", "Option 3", "Option 4"]
+
+    return "\n".join(intro_lines).strip(), questions
+
+
+def infer_type(type_hint, question_text):
+    hint = (type_hint or "").lower()
+    if "rating" in hint or re.search(r"\b(rate|rating|scale|satisfied)\b", question_text, re.I):
+        return "Rating scale"
+    if "yes" in hint or "binary" in hint or re.search(r"\b(do you|have you|is there|are you|would you)\b", question_text, re.I):
+        return "Yes/No"
+    if "open" in hint or re.search(r"\b(why|how|describe|explain|suggest)\b", question_text, re.I):
+        return "Open-ended"
+    if "multiple" in hint:
+        return "Multiple choice"
+    return "Multiple choice"
+
+
+def build_survey_text(intro, questions):
+    parts = [intro.strip()] if intro.strip() else []
+    for i, q in enumerate(questions, start=1):
+        parts.append(f"{i}. {q['text']} ({q['type']})")
+        if q["type"] == "Multiple choice":
+            for j, option in enumerate(q.get("options", [])):
+                letter = chr(65 + j)
+                parts.append(f"{letter}) {option}")
+        elif q["type"] == "Rating scale":
+            parts.append("Scale: 1 = Very dissatisfied, 5 = Very satisfied")
+        elif q["type"] == "Yes/No":
+            parts.append("A) Yes")
+            parts.append("B) No")
+        parts.append("")
+    return "\n".join(parts).strip()
 
 
 def generate_survey(topic, purpose, number, question_type, audience):
@@ -98,11 +228,8 @@ def generate_survey(topic, purpose, number, question_type, audience):
         raise ValueError("Gemini API key not found. Check your .env file.")
 
     client = genai.Client(api_key=api_key)
-
     prompt = f"""
-You are an expert survey designer.
-
-Create exactly {number} survey questions.
+You are an expert survey designer. Create exactly {number} survey questions.
 
 Topic: {topic}
 Purpose: {purpose or "Collect opinions about this topic"}
@@ -110,30 +237,28 @@ Target audience: {audience}
 Question type: {question_type}
 
 Requirements:
-1. Use simple, clear, unbiased language.
-2. Include a suitable title and short introduction.
-3. Number every question.
-4. Give four options for multiple-choice questions.
-5. Use a 1–5 scale for rating questions.
-6. Include Yes and No for binary questions.
-7. Make open-ended questions answerable in writing.
+1. Include a suitable survey title and short introduction.
+2. Number every question as 1., 2., 3., etc.
+3. Clearly label each question type using exactly one of:
+   (Multiple choice), (Rating scale), (Yes/No), (Open-ended).
+4. Multiple-choice questions must have four options, each on its own line,
+   labelled A), B), C), D).
+5. Rating questions must use a 1–5 scale.
+6. Yes/No questions must include A) Yes and B) No.
+7. Use simple, clear, unbiased language and avoid repetition.
 8. Avoid unnecessary personal information.
-9. Avoid repetitive questions.
-10. Do not invent correct answers for opinion questions.
-11. Match every question to the requested type.
-12. Return a clean, readable survey.
+9. Do not invent correct answers for opinion questions.
+10. Return only the readable survey, with no extra commentary.
 """
-
     for attempt in range(3):
         try:
             response = client.models.generate_content(
                 model="gemini-3.5-flash",
-                contents=prompt
+                contents=prompt,
             )
             if not response.text:
                 raise ValueError("The AI returned an empty response.")
             return clean_text(response.text)
-
         except Exception as error:
             message = str(error)
             if ("503" in message or "UNAVAILABLE" in message) and attempt < 2:
@@ -142,209 +267,524 @@ Requirements:
                 raise
 
 
-# ---------------- PAGE: CREATE SURVEY ----------------
+# ---------------- EXPORT HELPERS ----------------
+
+def make_pdf(title, content):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        rightMargin=20 * mm, leftMargin=20 * mm,
+        topMargin=18 * mm, bottomMargin=18 * mm,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "SurveyTitle", parent=styles["Title"],
+        textColor=colors.HexColor("#2457A6"), spaceAfter=12,
+    )
+    body_style = ParagraphStyle(
+        "SurveyBody", parent=styles["BodyText"],
+        leading=15, spaceAfter=6, wordWrap="CJK",
+    )
+    story = [Paragraph(escape_html(title), title_style), Spacer(1, 5)]
+    for line in clean_text(content).splitlines():
+        if line.strip():
+            story.append(Paragraph(escape_html(line), body_style))
+        else:
+            story.append(Spacer(1, 5))
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def escape_html(value):
+    return (
+        str(value).replace("&", "&amp;")
+        .replace("<", "&lt;").replace(">", "&gt;")
+    )
+
+
+def response_csv(responses):
+    rows = []
+    for response in responses:
+        row = {
+            "survey_id": response.get("survey_id", ""),
+            "survey_title": response.get("survey_title", ""),
+            "submitted_at": response.get("submitted_at", ""),
+        }
+        row.update(response.get("answers", {}))
+        rows.append(row)
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
+
+
+# ---------------- SIDEBAR ----------------
+
+# Apply requested navigation before creating the radio widget.
+if "requested_page" in st.session_state:
+    st.session_state["navigation"] = st.session_state.pop("requested_page")
+
+with st.sidebar:
+    st.title("📝 Survey Studio AI")
+    st.caption("AI-powered survey workspace")
+    st.divider()
+    page = st.radio(
+        "Navigation",
+        ["Create Survey", "Edit Surveys", "Collect Responses", "Analytics", "Survey History"],
+        key="navigation",
+    )
+    st.divider()
+    st.caption("Powered by Google Gemini")
+    st.caption("Your surveys and responses are stored locally.")
+
+
+# ============================================================
+# PAGE 1 — CREATE SURVEY
+# ============================================================
 
 if page == "Create Survey":
-    st.title("Create a New Survey")
-    st.write("Generate a custom questionnaire using AI.")
+    st.title("✨ Create a New Survey")
+    st.write("Generate, preview and save a questionnaire using Google Gemini.")
 
     with st.container(border=True):
-        st.subheader("Survey Details")
-
         col1, col2 = st.columns(2)
-
         with col1:
-            topic = st.text_input(
-                "Survey topic *",
-                placeholder="e.g. College canteen satisfaction"
-            )
-
+            topic = st.text_input("Survey topic *", placeholder="e.g. College canteen satisfaction")
             audience = st.selectbox(
                 "Target audience",
-                [
-                    "College students",
-                    "School students",
-                    "Teachers",
-                    "General public",
-                    "Employees"
-                ]
+                ["College students", "School students", "Teachers", "General public", "Employees"],
             )
-
         with col2:
             number = st.slider("Number of questions", 5, 20, 10)
-
             question_type = st.selectbox(
                 "Question type",
-                [
-                    "Mixed question types",
-                    "Multiple choice",
-                    "Rating scale",
-                    "Yes/No",
-                    "Open-ended"
-                ]
+                ["Mixed question types", "Multiple choice", "Rating scale", "Yes/No", "Open-ended"],
             )
-
-        purpose = st.text_area(
-            "What do you want to learn?",
-            placeholder="Describe the purpose of this survey..."
-        )
-
-        generate = st.button(
-            "✨ Generate Survey",
-            type="primary",
-            use_container_width=True
-        )
+        purpose = st.text_area("What do you want to learn?", placeholder="Describe the purpose of this survey...")
+        generate = st.button("✨ Generate Survey", type="primary", use_container_width=True)
 
     if generate:
         if not topic.strip():
             st.warning("Please enter a survey topic.")
         else:
             try:
-                with st.spinner("Creating your survey..."):
+                with st.spinner("Gemini is creating your survey..."):
                     survey_text = generate_survey(
-                        topic.strip(),
-                        purpose.strip(),
-                        number,
-                        question_type,
-                        audience
+                        topic.strip(), purpose.strip(), number, question_type, audience
                     )
-
-                survey_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
-
                 survey = {
-                    "id": survey_id,
+                    "id": make_id(),
                     "title": topic.strip(),
                     "purpose": purpose.strip(),
                     "audience": audience,
                     "question_type": question_type,
                     "question_count": number,
                     "content": survey_text,
-                    "created_at": datetime.now().isoformat()
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
                 }
-
-                st.session_state.current_survey = survey
-
                 surveys = load_json(SURVEYS_FILE)
                 surveys.append(survey)
                 save_json(SURVEYS_FILE, surveys)
-
+                st.session_state.current_survey = survey
                 st.success("Survey generated and saved locally!")
-
             except Exception as error:
                 st.error("Unable to generate the survey.")
-                st.caption(str(error))
+                st.exception(error)
 
     survey = st.session_state.current_survey
-
     if survey:
         st.divider()
         st.subheader("Survey Preview")
-        st.markdown(survey["content"])
-
-        col1, col2 = st.columns(2)
-
-        with col1:
+        st.markdown(survey.get("content", ""))
+        col_a, col_b = st.columns(2)
+        with col_a:
             st.download_button(
                 "⬇️ Download TXT",
-                data=survey["content"],
-                file_name="survey.txt",
+                data=survey.get("content", ""),
+                file_name=f"survey_{survey.get('id', 'latest')}.txt",
                 mime="text/plain",
-                use_container_width=True
+                use_container_width=True,
+            )
+        with col_b:
+            st.download_button(
+                "📄 Download PDF",
+                data=make_pdf(survey.get("title", "Survey"), survey.get("content", "")),
+                file_name=f"survey_{survey.get('id', 'latest')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
             )
 
-        with col2:
-            pdf_placeholder = st.button(
-                "📄 PDF export — coming next",
-                disabled=True,
-                use_container_width=True
-            )
 
-
-# ---------------- PAGE: EDIT SURVEYS ----------------
+# ============================================================
+# PAGE 2 — EDIT SURVEYS
+# ============================================================
 
 elif page == "Edit Surveys":
-    st.title("Edit Surveys")
-    st.info(
-        "The next upgrade will add editable question fields, "
-        "plus add and delete question controls."
-    )
-
+    st.title("✏️ Edit Surveys")
     surveys = load_json(SURVEYS_FILE)
 
-    if surveys:
-        options = {
-            f'{s["title"]} — {s["created_at"][:10]} ({s["id"]})': s
+    if not surveys:
+        st.info("No saved surveys yet. Create a survey first.")
+    else:
+        labels = {
+            f"{s.get('title', 'Untitled')} — {s.get('created_at', '')[:10]} ({s.get('id', '')})": s
             for s in surveys
         }
-        selected_label = st.selectbox("Choose a saved survey", list(options))
-        st.text_area(
-            "Survey content",
-            value=options[selected_label]["content"],
-            height=300,
-            disabled=True
+        selected_label = st.selectbox("Choose a saved survey", list(labels))
+        selected = labels[selected_label]
+        survey_id = selected.get("id", "unknown")
+        pending_key = f"draft_questions_{survey_id}"
+        revision_key = f"editor_revision_{survey_id}"
+
+        if revision_key not in st.session_state:
+            st.session_state[revision_key] = 0
+
+        intro, parsed_questions = parse_survey(selected.get("content", ""))
+        working_questions = st.session_state.get(pending_key, parsed_questions)
+
+        st.caption("Edit the survey introduction and questions. Add or remove questions, then save your changes.")
+        edited_title = st.text_input(
+            "Survey title", value=selected.get("title", ""),
+            key=f"edit_title_{survey_id}",
         )
-    else:
-        st.info("Your saved surveys will appear here.")
+        edited_intro = st.text_area(
+            "Introduction / instructions", value=intro, height=100,
+            key=f"edit_intro_{survey_id}",
+        )
+
+        if not working_questions:
+            st.warning("No numbered questions were detected. You can edit the full survey text below.")
+            edited_content = st.text_area(
+                "Full survey content", value=selected.get("content", ""),
+                height=350, key=f"raw_edit_{survey_id}",
+            )
+            if st.button("Save survey changes", type="primary", key=f"save_raw_{survey_id}"):
+                try:
+                    for item in surveys:
+                        if item.get("id") == survey_id:
+                            item["title"] = edited_title.strip() or "Untitled survey"
+                            item["content"] = edited_content
+                            item["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    save_json(SURVEYS_FILE, surveys)
+                    st.session_state.pop(pending_key, None)
+                    st.success("Survey changes saved successfully.")
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Could not save the survey: {error}")
+        else:
+            revision = st.session_state[revision_key]
+            updated_questions = []
+
+            for i, q in enumerate(working_questions):
+                with st.expander(f"Question {i + 1}: {q['text'][:75]}", expanded=(i == 0)):
+                    q_text = st.text_input(
+                        "Question text", value=q["text"],
+                        key=f"edit_q_{survey_id}_{revision}_{i}",
+                    )
+                    question_types = ["Multiple choice", "Rating scale", "Yes/No", "Open-ended"]
+                    current_type = q.get("type", "Multiple choice")
+                    if current_type not in question_types:
+                        current_type = "Multiple choice"
+                    q_type = st.selectbox(
+                        "Question type", question_types,
+                        index=question_types.index(current_type),
+                        key=f"edit_type_{survey_id}_{revision}_{i}",
+                    )
+                    options_text = "\n".join(q.get("options", []))
+                    if q_type == "Multiple choice":
+                        options_text = st.text_area(
+                            "Answer options (one per line)", value=options_text,
+                            key=f"edit_opts_{survey_id}_{revision}_{i}", height=100,
+                        )
+                        options = [x.strip() for x in options_text.splitlines() if x.strip()]
+                    else:
+                        options = []
+                    updated_questions.append({
+                        "text": q_text.strip(), "type": q_type, "options": options,
+                    })
+
+            st.markdown("**Add a new question**")
+            new_q_text = st.text_input("New question text", key=f"new_q_{survey_id}_{revision}")
+            new_q_type = st.selectbox(
+                "New question type",
+                ["Multiple choice", "Rating scale", "Yes/No", "Open-ended"],
+                key=f"new_type_{survey_id}_{revision}",
+            )
+            new_options_text = ""
+            if new_q_type == "Multiple choice":
+                new_options_text = st.text_area(
+                    "New question options (one per line)",
+                    value="Option 1\nOption 2\nOption 3\nOption 4",
+                    key=f"new_opts_{survey_id}_{revision}", height=90,
+                )
+
+            if st.button("➕ Add question", key=f"add_q_{survey_id}_{revision}"):
+                if not new_q_text.strip():
+                    st.warning("Enter the new question text first.")
+                else:
+                    updated_questions.append({
+                        "text": new_q_text.strip(), "type": new_q_type,
+                        "options": [x.strip() for x in new_options_text.splitlines() if x.strip()],
+                    })
+                    st.session_state[pending_key] = updated_questions
+                    st.session_state[revision_key] += 1
+                    st.rerun()
+
+            delete_options = ["Do not delete"] + [
+                f"Question {i + 1}: {q['text'][:60]}" for i, q in enumerate(updated_questions)
+            ]
+            delete_index = st.selectbox(
+                "Delete a question (optional)", options=delete_options,
+                key=f"delete_q_{survey_id}_{revision}",
+            )
+
+            if st.button("🗑️ Remove selected question", key=f"remove_q_{survey_id}_{revision}"):
+                if delete_index == "Do not delete":
+                    st.warning("Choose a question to remove first.")
+                else:
+                    remove_idx = delete_options.index(delete_index) - 1
+                    updated_questions.pop(remove_idx)
+                    st.session_state[pending_key] = updated_questions
+                    st.session_state[revision_key] += 1
+                    st.rerun()
+
+            if st.button("💾 Save changes", type="primary", key=f"save_edit_{survey_id}_{revision}"):
+                try:
+                    if any(not q["text"].strip() for q in updated_questions):
+                        st.warning("Every question must have question text before saving.")
+                    elif not updated_questions:
+                        st.warning("A survey must contain at least one question.")
+                    elif any(q["type"] == "Multiple choice" and not q["options"] for q in updated_questions):
+                        st.warning("Each multiple-choice question must have at least one answer option.")
+                    else:
+                        final_content = build_survey_text(edited_intro, updated_questions)
+                        for item in surveys:
+                            if item.get("id") == survey_id:
+                                item["title"] = edited_title.strip() or "Untitled survey"
+                                item["content"] = final_content
+                                item["question_count"] = len(updated_questions)
+                                item["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                        save_json(SURVEYS_FILE, surveys)
+                        st.session_state.pop(pending_key, None)
+                        st.success("Survey changes saved successfully.")
+                        st.rerun()
+                except Exception as error:
+                    st.error(f"Could not save your changes: {error}")
 
 
-# ---------------- PAGE: COLLECT RESPONSES ----------------
+# ============================================================
+# PAGE 3 — COLLECT RESPONSES
+# ============================================================
 
 elif page == "Collect Responses":
-    st.title("Collect Responses")
-    st.info(
-        "The next upgrade will add a respondent form and "
-        "save answers locally."
-    )
-
-
-# ---------------- PAGE: ANALYTICS ----------------
-
-elif page == "Analytics":
-    st.title("Survey Analytics")
+    st.title("📋 Collect Responses")
     surveys = load_json(SURVEYS_FILE)
     responses = load_json(RESPONSES_FILE)
 
-    col1, col2, col3 = st.columns(3)
+    if not surveys:
+        st.info("Create a survey before collecting responses.")
+    else:
+        survey_labels = {
+            f"{s.get('title', 'Untitled')} — {s.get('created_at', '')[:10]}": s
+            for s in surveys
+        }
+        chosen_label = st.selectbox("Select a survey for respondents", list(survey_labels))
+        chosen = survey_labels[chosen_label]
+        intro, questions = parse_survey(chosen.get("content", ""))
+
+        st.subheader(chosen.get("title", "Survey"))
+        if intro:
+            st.write(intro)
+        if not questions:
+            st.warning("No numbered questions were detected. Edit the survey so each question starts with 1., 2., 3., etc.")
+        else:
+            with st.form(f"response_form_{chosen.get('id')}"):
+                respondent_name = st.text_input("Name (optional)")
+                answers = {}
+                for i, question in enumerate(questions):
+                    q_label = f"{i + 1}. {question['text']}"
+                    if question["type"] == "Multiple choice":
+                        options = question.get("options") or ["Option 1", "Option 2", "Option 3", "Option 4"]
+                        answers[q_label] = st.radio(q_label, options, key=f"answer_{chosen.get('id')}_{i}")
+                    elif question["type"] == "Rating scale":
+                        answers[q_label] = st.select_slider(
+                            q_label, options=[1, 2, 3, 4, 5],
+                            value=3, key=f"answer_{chosen.get('id')}_{i}",
+                        )
+                    elif question["type"] == "Yes/No":
+                        answers[q_label] = st.radio(
+                            q_label, ["Yes", "No"],
+                            horizontal=True, key=f"answer_{chosen.get('id')}_{i}",
+                        )
+                    else:
+                        answers[q_label] = st.text_area(
+                            q_label, key=f"answer_{chosen.get('id')}_{i}",
+                        )
+                submitted = st.form_submit_button("Submit response", type="primary", use_container_width=True)
+
+            if submitted:
+                try:
+                    response_record = {
+                        "id": make_id(),
+                        "survey_id": chosen.get("id"),
+                        "survey_title": chosen.get("title", "Survey"),
+                        "respondent_name": respondent_name.strip() or "Anonymous",
+                        "submitted_at": datetime.now().isoformat(timespec="seconds"),
+                        "answers": answers,
+                    }
+                    responses.append(response_record)
+                    save_json(RESPONSES_FILE, responses)
+                    st.session_state[f"response_saved_{chosen.get('id')}"] = True
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Could not save your response: {error}")
+
+        if st.session_state.pop(f"response_saved_{chosen.get('id')}", False):
+            st.success("Thank you! Your response has been saved locally.")
+
+        survey_responses = [r for r in responses if r.get("survey_id") == chosen.get("id")]
+        st.caption(f"Responses saved for this survey: {len(survey_responses)}")
+
+
+# ============================================================
+# PAGE 4 — ANALYTICS
+# ============================================================
+
+elif page == "Analytics":
+    st.title("📊 Survey Analytics")
+    surveys = load_json(SURVEYS_FILE)
+    responses = load_json(RESPONSES_FILE)
+
+    total_responses = len(responses)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Surveys created", len(surveys))
-    col2.metric("Responses received", len(responses))
+    col2.metric("Responses received", total_responses)
     col3.metric(
         "Average responses per survey",
-        round(len(responses) / len(surveys), 1) if surveys else 0
+        round(total_responses / len(surveys), 1) if surveys else 0,
+    )
+    col4.metric(
+        "Surveys with responses",
+        len({r.get("survey_id") for r in responses if r.get("survey_id")}),
     )
 
-    st.info(
-        "Question-level charts and response analysis will be added "
-        "after response collection is implemented."
-    )
+    if not surveys:
+        st.info("Create a survey to start seeing analytics.")
+    elif not responses:
+        st.info("No responses have been collected yet. Open Collect Responses and submit a test response.")
+    else:
+        survey_labels = {
+            f"{s.get('title', 'Untitled')} — {s.get('created_at', '')[:10]}": s
+            for s in surveys
+        }
+        selected_label = st.selectbox("Choose a survey to analyse", list(survey_labels))
+        selected = survey_labels[selected_label]
+        survey_responses = [r for r in responses if r.get("survey_id") == selected.get("id")]
+        st.subheader(selected.get("title", "Survey"))
+        st.metric("Responses for this survey", len(survey_responses))
+
+        if survey_responses:
+            intro, questions = parse_survey(selected.get("content", ""))
+            for i, question in enumerate(questions):
+                question_label = f"{i + 1}. {question['text']}"
+                values = [
+                    r.get("answers", {}).get(question_label)
+                    for r in survey_responses
+                    if r.get("answers", {}).get(question_label) not in (None, "")
+                ]
+                if not values:
+                    continue
+                with st.expander(question_label, expanded=True):
+                    if question["type"] in ("Multiple choice", "Yes/No"):
+                        counts = pd.Series(values).astype(str).value_counts()
+                        st.bar_chart(counts)
+                        st.dataframe(
+                            counts.rename_axis("Answer").reset_index(name="Responses"),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    elif question["type"] == "Rating scale":
+                        numeric = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
+                        if not numeric.empty:
+                            counts = numeric.value_counts().sort_index()
+                            st.bar_chart(counts)
+                            st.metric("Average rating", round(float(numeric.mean()), 2))
+                    else:
+                        st.write("**Written answers**")
+                        for value in values:
+                            st.write(f"• {value}")
+
+            st.download_button(
+                "⬇️ Export responses as CSV",
+                data=response_csv(survey_responses),
+                file_name=f"responses_{selected.get('id', 'survey')}.csv",
+                mime="text/csv",
+            )
 
 
-# ---------------- PAGE: SURVEY HISTORY ----------------
+# ============================================================
+# PAGE 5 — SURVEY HISTORY
+# ============================================================
 
 elif page == "Survey History":
-    st.title("Survey History")
+    st.title("🕘 Survey History")
     surveys = load_json(SURVEYS_FILE)
+    responses = load_json(RESPONSES_FILE)
 
-    if surveys:
-        for survey in reversed(surveys):
-            with st.expander(
-                f'{survey["title"]} — {survey["created_at"][:10]}'
-            ):
-                st.write("Audience:", survey["audience"])
-                st.write("Questions requested:", survey["question_count"])
-                st.text(survey["content"])
-
-                st.download_button(
-                    "Download this survey",
-                    data=survey["content"],
-                    file_name=f'survey_{survey["id"]}.txt',
-                    mime="text/plain",
-                    key=f'download_{survey["id"]}'
-                )
-    else:
+    if not surveys:
         st.info("No saved surveys yet. Create your first survey!")
+    else:
+        search = st.text_input("Search surveys by title or content")
+        filtered = [
+            s for s in surveys
+            if search.strip().lower() in (
+                str(s.get("title", "")) + " " + str(s.get("content", ""))
+            ).lower()
+        ]
+        st.caption(f"Showing {len(filtered)} of {len(surveys)} saved surveys.")
+
+        for survey in reversed(filtered):
+            sid = survey.get("id", "")
+            survey_responses = [r for r in responses if r.get("survey_id") == sid]
+            heading = f"{survey.get('title', 'Untitled')} — {survey.get('created_at', '')[:10]}"
+            with st.expander(heading):
+                st.write("**Audience:**", survey.get("audience", "Not recorded"))
+                st.write("**Questions:**", survey.get("question_count", "Not recorded"))
+                st.write("**Responses:**", len(survey_responses))
+                st.markdown(survey.get("content", ""))
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.download_button(
+                        "Download TXT",
+                        data=survey.get("content", ""),
+                        file_name=f"survey_{sid}.txt",
+                        mime="text/plain",
+                        key=f"history_txt_{sid}",
+                        use_container_width=True,
+                    )
+                with c2:
+                    st.download_button(
+                        "Download PDF",
+                        data=make_pdf(survey.get("title", "Survey"), survey.get("content", "")),
+                        file_name=f"survey_{sid}.pdf",
+                        mime="application/pdf",
+                        key=f"history_pdf_{sid}",
+                        use_container_width=True,
+                    )
+                with c3:
+                    if st.button("Open in editor", key=f"open_edit_{sid}", use_container_width=True):
+                        st.session_state["requested_page"] = "Edit Surveys"
+                        st.rerun()
+
+                if st.button("🗑️ Delete survey and its responses", key=f"delete_survey_{sid}"):
+                    remaining_surveys = [s for s in surveys if s.get("id") != sid]
+                    remaining_responses = [r for r in responses if r.get("survey_id") != sid]
+                    save_json(SURVEYS_FILE, remaining_surveys)
+                    save_json(RESPONSES_FILE, remaining_responses)
+                    st.success("Survey and its associated responses were deleted.")
+                    st.rerun()
 
 
 # ---------------- FOOTER ----------------
 
 st.divider()
-st.caption("Survey Studio AI | Built with Python, Streamlit & Gemini")
+st.caption("Survey Studio AI | Built with Python, Streamlit & Gemini | Local JSON storage")
