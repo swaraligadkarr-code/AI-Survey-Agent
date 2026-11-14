@@ -85,8 +85,8 @@ DATA_DIR = Path("survey_data")
 DATA_DIR.mkdir(exist_ok=True)
 SURVEYS_FILE = DATA_DIR / "surveys.json"
 RESPONSES_FILE = DATA_DIR / "responses.json"
-api_key = os.getenv("GEMINI_API_KEY")
-
+api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+client = genai.Client(api_key=api_key)
 
 # ---------------- LOCAL JSON STORAGE ----------------
 
